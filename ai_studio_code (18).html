@@ -155,6 +155,12 @@
                 </h2>
                 
                 <div class="flex items-center gap-3">
+                    <!-- Batch Delete Button -->
+                    <button id="btnBatchDelete" class="hidden bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-xl text-sm font-bold transition-all flex items-center gap-2 shadow-lg shadow-red-100">
+                        <i data-lucide="trash-2" class="w-4 h-4"></i>
+                        <span id="batchDeleteText">删除选中 (0)</span>
+                    </button>
+
                     <div class="relative">
                         <i data-lucide="map-pinned" class="absolute left-3 top-2.5 w-4 h-4 text-slate-400"></i>
                         <input type="text" id="filterLocation" class="pl-9 pr-4 py-2 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all" data-i18n-placeholder="filterLocationPlaceholder" placeholder="筛选库位...">
@@ -170,6 +176,9 @@
                 <table class="w-full text-left border-collapse">
                     <thead class="bg-slate-50/50 sticky top-0 z-10 backdrop-blur-sm">
                         <tr>
+                            <th class="p-4 border-b w-10">
+                                <input type="checkbox" id="selectAll" class="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer">
+                            </th>
                             <th class="p-4 border-b text-[11px] font-bold uppercase tracking-wider text-slate-500" data-i18n="colTime">时间</th>
                             <th class="p-4 border-b text-[11px] font-bold uppercase tracking-wider text-slate-500" data-i18n="colBarcode">条码</th>
                             <th class="p-4 border-b text-[11px] font-bold uppercase tracking-wider text-slate-500" data-i18n="colSku">SKU</th>
@@ -230,7 +239,7 @@
                 placeholderBarcode: "扫描条码...", placeholderLocation: "输入存储库位...", 
                 placeholderSku: "输入 SKU...", filterLocationPlaceholder: "筛选库位...", 
                 saveSuccess: "已同步至云端", errorNotFound: "主库未找到该条码", errorNoSku: "未找到该 SKU",
-                modalSku: "SKU 编码", modalSkc: "SKC 编码"
+                modalSku: "SKU 编码", modalSkc: "SKC 编码", batchDeleteBtn: "删除选中", deleteSuccess: "记录已批量删除"
             },
             en: {
                 cloudStatus: "Cloud Active", appTitle: "KY Cloud", scanningTitle: "Registration", 
@@ -242,7 +251,7 @@
                 placeholderBarcode: "Scan barcode...", placeholderLocation: "Enter location...", 
                 placeholderSku: "Enter SKU...", filterLocationPlaceholder: "Filter location...", 
                 saveSuccess: "Synced to cloud", errorNotFound: "Barcode not found", errorNoSku: "SKU not found",
-                modalSku: "SKU Code", modalSkc: "SKC Code"
+                modalSku: "SKU Code", modalSkc: "SKC Code", batchDeleteBtn: "Delete Selected", deleteSuccess: "Batch deleted"
             },
             es: {
                 cloudStatus: "Nube Activa", appTitle: "KY Cloud", scanningTitle: "Registro", 
@@ -254,7 +263,7 @@
                 placeholderBarcode: "Escanear...", placeholderLocation: "Ubicación...", 
                 placeholderSku: "SKU...", filterLocationPlaceholder: "Filtrar...", 
                 saveSuccess: "Sincronizado", errorNotFound: "No encontrado", errorNoSku: "No encontrado",
-                modalSku: "Código SKU", modalSkc: "Código SKC"
+                modalSku: "Código SKU", modalSkc: "Código SKC", batchDeleteBtn: "Eliminar seleccionados", deleteSuccess: "Registros eliminados"
             }
         };
 
@@ -262,10 +271,9 @@
         let activeMapping = null;
         let currentQueryRecordId = null;
         let cachedInventory = [];
-        
-        // Fix 1: Request Locking Flag
+        let filteredInventory = [];
+        let selectedIds = new Set();
         let isSubmitting = false;
-        // Fix 2: Initialization Guard Flag
         let isInitialized = false;
 
         function updateUI() {
@@ -278,26 +286,33 @@
                 const key = el.getAttribute('data-i18n-placeholder');
                 if (t[key]) el.placeholder = t[key];
             });
+            updateBatchButton();
             lucide.createIcons();
         }
 
         async function init() {
-            // Fix 2: Prevent multiple event listener stacking
             if (isInitialized) return;
             isInitialized = true;
-
             updateUI();
             fetchInventory();
-            
-            // Single Realtime subscription
-            supabaseClient
-                .channel('any')
-                .on('postgres_changes', { event: '*', table: 'inventory', schema: 'public' }, () => fetchInventory())
-                .subscribe();
-
+            supabaseClient.channel('any').on('postgres_changes', { event: '*', table: 'inventory', schema: 'public' }, () => fetchInventory()).subscribe();
             document.getElementById('querySkuInput').addEventListener('keypress', (e) => {
                 if (e.key === 'Enter') document.getElementById('btnQuery').click();
             });
+            
+            // Batch Delete Listener
+            document.getElementById('btnBatchDelete').onclick = deleteBatch;
+            
+            // Select All Listener
+            document.getElementById('selectAll').onchange = (e) => {
+                if (e.target.checked) {
+                    filteredInventory.forEach(item => selectedIds.add(item.id || item.TIME));
+                } else {
+                    selectedIds.clear();
+                }
+                renderTable(filteredInventory);
+                updateBatchButton();
+            };
         }
 
         async function fetchInventory() {
@@ -311,7 +326,8 @@
         function applyFilters() {
             const loc = document.getElementById('filterLocation').value.trim().toLowerCase();
             const date = document.getElementById('filterDate').value;
-            const filtered = cachedInventory.filter(item => {
+            
+            filteredInventory = cachedInventory.filter(item => {
                 const matchLoc = item.LOCATION.toLowerCase().includes(loc);
                 let matchDate = true;
                 if (date) {
@@ -320,14 +336,68 @@
                 }
                 return matchLoc && matchDate;
             });
-            renderTable(filtered);
+            
+            // Reset selection on filter change
+            selectedIds.clear();
+            document.getElementById('selectAll').checked = false;
+            updateBatchButton();
+            renderTable(filteredInventory);
+        }
+
+        function updateBatchButton() {
+            const btn = document.getElementById('btnBatchDelete');
+            const text = document.getElementById('batchDeleteText');
+            if (selectedIds.size > 0) {
+                btn.classList.remove('hidden');
+                text.textContent = `${translations[currentLang].batchDeleteBtn} (${selectedIds.size})`;
+            } else {
+                btn.classList.add('hidden');
+            }
+        }
+
+        function toggleRowSelection(id) {
+            if (selectedIds.has(id)) selectedIds.delete(id);
+            else selectedIds.add(id);
+            updateBatchButton();
+            
+            // Update selectAll state
+            const allSelected = filteredInventory.length > 0 && filteredInventory.every(i => selectedIds.has(i.id || i.TIME));
+            document.getElementById('selectAll').checked = allSelected;
+        }
+
+        async function deleteBatch() {
+            if (selectedIds.size === 0 || !confirm('Are you sure?')) return;
+            
+            const idsToDelete = Array.from(selectedIds);
+            const isUsingId = filteredInventory.some(i => !!i.id);
+            const column = isUsingId ? 'id' : 'TIME';
+
+            const { error } = await supabaseClient
+                .from('inventory')
+                .delete()
+                .in(column, idsToDelete);
+
+            if (!error) {
+                selectedIds.clear();
+                document.getElementById('selectAll').checked = false;
+                updateBatchButton();
+                const status = document.getElementById('scanStatus');
+                status.innerHTML = `<i data-lucide="check-circle" class="w-4 h-4 text-emerald-500"></i> ${translations[currentLang].deleteSuccess}`;
+                setTimeout(() => status.innerHTML = "", 2000);
+            }
         }
 
         function renderTable(data) {
             const body = document.getElementById('inventoryBody');
             document.getElementById('itemCount').textContent = data.length;
-            body.innerHTML = data.map(r => `
-                <tr class="hover:bg-slate-50 transition-colors">
+            body.innerHTML = data.map(r => {
+                const rowId = r.id || r.TIME;
+                const isChecked = selectedIds.has(rowId);
+                return `
+                <tr class="hover:bg-slate-50 transition-colors ${isChecked ? 'bg-indigo-50/30' : ''}">
+                    <td class="p-4">
+                        <input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleRowSelection('${rowId}')" class="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer">
+                    </td>
                     <td class="p-4 text-[10px] font-mono text-slate-400">${new Date(r.TIME).toLocaleString()}</td>
                     <td class="p-4 text-sm font-medium text-slate-700">${r.BARCODE || ''}</td>
                     <td class="p-4 text-sm font-bold text-indigo-600">${r.SKU || ''}</td>
@@ -338,11 +408,11 @@
                         </span>
                     </td>
                     <td class="p-4 text-center">
-                        <button onclick="deleteCloudRow('${r.id || r.TIME}', ${!!r.id})" class="text-slate-300 hover:text-red-500 transition-all p-1 hover:bg-red-50 rounded-lg">
+                        <button onclick="deleteCloudRow('${rowId}', ${!!r.id})" class="text-slate-300 hover:text-red-500 transition-all p-1 hover:bg-red-50 rounded-lg">
                             <i data-lucide="trash-2" class="w-5 h-5"></i>
                         </button>
                     </td>
-                </tr>`).join('');
+                </tr>`}).join('');
             lucide.createIcons();
         }
 
@@ -351,22 +421,10 @@
             if (e.key === 'Enter') {
                 const rawBar = barcodeInput.value.trim();
                 if (!rawBar) return;
-
                 const tenDigitBarcode = rawBar.slice(-10);
                 barcodeInput.value = tenDigitBarcode;
-
-                const { data, error } = await supabaseClient
-                    .from('product_data')
-                    .select('sku, skc, goods_bar_cd')
-                    .eq('goods_bar_cd', tenDigitBarcode)
-                    .maybeSingle();
-
-                if (data) {
-                    activeMapping = { ...data, processedBarcode: tenDigitBarcode };
-                } else {
-                    activeMapping = { sku: "", skc: "", processedBarcode: tenDigitBarcode };
-                }
-                
+                const { data } = await supabaseClient.from('product_data').select('sku, skc').eq('goods_bar_cd', tenDigitBarcode).maybeSingle();
+                activeMapping = data ? { ...data, processedBarcode: tenDigitBarcode } : { sku: "", skc: "", processedBarcode: tenDigitBarcode };
                 barcodeInput.classList.remove('input-error');
                 document.getElementById('barcodeError').style.opacity = "0";
                 document.getElementById('scanLocation').focus();
@@ -376,15 +434,11 @@
         const locationInput = document.getElementById('scanLocation');
         locationInput.addEventListener('keydown', async (e) => {
             if (e.key === 'Enter') {
-                // Fix 1: Request Locking & UI Disable
                 if (isSubmitting) return;
-                
                 const loc = locationInput.value.trim();
                 if (!loc || !activeMapping) return;
-
                 isSubmitting = true;
                 locationInput.disabled = true;
-
                 try {
                     const { error } = await supabaseClient.from('inventory').insert([{
                         TIME: new Date().toISOString(),
@@ -393,24 +447,15 @@
                         SKC: activeMapping.skc,
                         LOCATION: loc
                     }]);
-
                     if (!error) {
                         const status = document.getElementById('scanStatus');
                         status.innerHTML = `<i data-lucide="check-circle" class="w-4 h-4 text-emerald-500"></i> ${translations[currentLang].saveSuccess}`;
-                        
-                        // Fix 3: Immediate State Reset
                         activeMapping = null;
-                        
-                        barcodeInput.value = ''; 
-                        locationInput.value = ''; 
-                        barcodeInput.focus();
+                        barcodeInput.value = ''; locationInput.value = ''; barcodeInput.focus();
                         lucide.createIcons();
                         setTimeout(() => status.innerHTML = "", 2000);
                     }
-                } catch (err) {
-                    console.error("Submission error:", err);
                 } finally {
-                    // Fix 1: Release Lock & Re-enable UI
                     isSubmitting = false;
                     locationInput.disabled = false;
                 }
@@ -427,16 +472,15 @@
         document.getElementById('btnQuery').onclick = async () => {
             const skuVal = document.getElementById('querySkuInput').value.trim();
             if (!skuVal) return;
-            const { data, error } = await supabaseClient.from('inventory').select('*').eq('SKU', skuVal).limit(1).single();
+            const { data } = await supabaseClient.from('inventory').select('*').eq('SKU', skuVal).limit(1).single();
             if (data) {
                 currentQueryRecordId = data.id || data.TIME;
-                const hasId = !!data.id;
                 document.getElementById('modalLocationDisplay').textContent = data.LOCATION;
                 document.getElementById('modalSkuDisplay').textContent = data.SKU || '---';
                 document.getElementById('modalSkcDisplay').textContent = data.SKC || '---';
                 document.getElementById('queryModal').classList.remove('hidden');
                 document.getElementById('btnDeleteRecord').onclick = async () => {
-                    await deleteCloudRow(currentQueryRecordId, hasId);
+                    await deleteCloudRow(currentQueryRecordId, !!data.id);
                     document.getElementById('queryModal').classList.add('hidden');
                 };
             } else {
