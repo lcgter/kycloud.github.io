@@ -193,7 +193,6 @@
             <h3 class="text-slate-500 font-bold text-xs uppercase tracking-widest mb-2" data-i18n="modalTitle">货物所在库位:</h3>
             <div id="modalLocationDisplay" class="text-6xl font-black text-slate-900 mb-6 tracking-tighter">---</div>
             
-            <!-- SKU & SKC Display Block -->
             <div class="flex gap-3 mb-8">
                 <div class="flex-1 bg-slate-50 p-3 rounded-2xl border border-slate-100">
                     <p class="text-[10px] font-bold text-slate-400 uppercase mb-1" data-i18n="modalSku">SKU 编码</p>
@@ -263,6 +262,11 @@
         let activeMapping = null;
         let currentQueryRecordId = null;
         let cachedInventory = [];
+        
+        // Fix 1: Request Locking Flag
+        let isSubmitting = false;
+        // Fix 2: Initialization Guard Flag
+        let isInitialized = false;
 
         function updateUI() {
             const t = translations[currentLang];
@@ -278,9 +282,19 @@
         }
 
         async function init() {
+            // Fix 2: Prevent multiple event listener stacking
+            if (isInitialized) return;
+            isInitialized = true;
+
             updateUI();
             fetchInventory();
-            supabaseClient.channel('any').on('postgres_changes', { event: '*', table: 'inventory', schema: 'public' }, () => fetchInventory()).subscribe();
+            
+            // Single Realtime subscription
+            supabaseClient
+                .channel('any')
+                .on('postgres_changes', { event: '*', table: 'inventory', schema: 'public' }, () => fetchInventory())
+                .subscribe();
+
             document.getElementById('querySkuInput').addEventListener('keypress', (e) => {
                 if (e.key === 'Enter') document.getElementById('btnQuery').click();
             });
@@ -332,7 +346,6 @@
             lucide.createIcons();
         }
 
-        // --- UPDATED SCANNING LOGIC ---
         const barcodeInput = document.getElementById('scanBarcode');
         barcodeInput.addEventListener('keydown', async (e) => {
             if (e.key === 'Enter') {
@@ -348,15 +361,12 @@
                     .eq('goods_bar_cd', tenDigitBarcode)
                     .maybeSingle();
 
-                // Modification 1: Allow blind scan registration
                 if (data) {
                     activeMapping = { ...data, processedBarcode: tenDigitBarcode };
                 } else {
-                    // Create empty mapping if no product data is found
                     activeMapping = { sku: "", skc: "", processedBarcode: tenDigitBarcode };
                 }
                 
-                // Always remove error state and shift focus
                 barcodeInput.classList.remove('input-error');
                 document.getElementById('barcodeError').style.opacity = "0";
                 document.getElementById('scanLocation').focus();
@@ -366,24 +376,43 @@
         const locationInput = document.getElementById('scanLocation');
         locationInput.addEventListener('keydown', async (e) => {
             if (e.key === 'Enter') {
+                // Fix 1: Request Locking & UI Disable
+                if (isSubmitting) return;
+                
                 const loc = locationInput.value.trim();
                 if (!loc || !activeMapping) return;
 
-                const { error } = await supabaseClient.from('inventory').insert([{
-                    TIME: new Date().toISOString(),
-                    BARCODE: activeMapping.processedBarcode,
-                    SKU: activeMapping.sku,
-                    SKC: activeMapping.skc,
-                    LOCATION: loc
-                }]);
+                isSubmitting = true;
+                locationInput.disabled = true;
 
-                if (!error) {
-                    const status = document.getElementById('scanStatus');
-                    status.innerHTML = `<i data-lucide="check-circle" class="w-4 h-4 text-emerald-500"></i> ${translations[currentLang].saveSuccess}`;
-                    barcodeInput.value = ''; locationInput.value = ''; activeMapping = null;
-                    barcodeInput.focus();
-                    lucide.createIcons();
-                    setTimeout(() => status.innerHTML = "", 2000);
+                try {
+                    const { error } = await supabaseClient.from('inventory').insert([{
+                        TIME: new Date().toISOString(),
+                        BARCODE: activeMapping.processedBarcode,
+                        SKU: activeMapping.sku,
+                        SKC: activeMapping.skc,
+                        LOCATION: loc
+                    }]);
+
+                    if (!error) {
+                        const status = document.getElementById('scanStatus');
+                        status.innerHTML = `<i data-lucide="check-circle" class="w-4 h-4 text-emerald-500"></i> ${translations[currentLang].saveSuccess}`;
+                        
+                        // Fix 3: Immediate State Reset
+                        activeMapping = null;
+                        
+                        barcodeInput.value = ''; 
+                        locationInput.value = ''; 
+                        barcodeInput.focus();
+                        lucide.createIcons();
+                        setTimeout(() => status.innerHTML = "", 2000);
+                    }
+                } catch (err) {
+                    console.error("Submission error:", err);
+                } finally {
+                    // Fix 1: Release Lock & Re-enable UI
+                    isSubmitting = false;
+                    locationInput.disabled = false;
                 }
             }
         });
@@ -395,7 +424,6 @@
             await query;
         }
 
-        // --- UPDATED QUERY MODAL LOGIC ---
         document.getElementById('btnQuery').onclick = async () => {
             const skuVal = document.getElementById('querySkuInput').value.trim();
             if (!skuVal) return;
@@ -403,14 +431,9 @@
             if (data) {
                 currentQueryRecordId = data.id || data.TIME;
                 const hasId = !!data.id;
-                
-                // Render Location
                 document.getElementById('modalLocationDisplay').textContent = data.LOCATION;
-                
-                // Modification 2: Render SKU & SKC Display
                 document.getElementById('modalSkuDisplay').textContent = data.SKU || '---';
                 document.getElementById('modalSkcDisplay').textContent = data.SKC || '---';
-                
                 document.getElementById('queryModal').classList.remove('hidden');
                 document.getElementById('btnDeleteRecord').onclick = async () => {
                     await deleteCloudRow(currentQueryRecordId, hasId);
